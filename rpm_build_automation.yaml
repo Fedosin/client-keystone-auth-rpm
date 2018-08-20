@@ -1,0 +1,143 @@
+---
+# Ansible rpm build automation for client_keystone_auth using docker container
+# Usage: "sudo ansible-playbook rpm_build_automation.yaml --extra-vars='branch_name=<BRANCH_NAME>'"
+# Example: "sudo ansible-playbook rpm_build_automation.yaml --extra-vars='branch_name=v0.2.0'"
+# Output: built packages in "rpms/" folder
+# Installed docker is required for this playbook
+- hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+
+    - name: start build container
+      docker_container:
+        name: "{{ vmname }}"
+        hostname: "{{ vmname }}"
+        image: "centos:7"
+        state: started
+        tty: yes
+        keep_volumes: no
+
+    - name: add container to inventory
+      add_host:
+        name: "{{ vmname }}"
+        ansible_host: "{{ vmname }}"
+        ansible_user: root
+        ansible_connection: docker
+      changed_when: false
+  vars:
+      vmname: build-centos7
+
+- hosts: build-centos7
+  gather_facts: no
+
+  vars:
+    goroot: /usr/local/go
+    gopath: /opt/go
+    goversion: 1.10.3
+
+  tasks:
+
+    - name: Install EPEL
+      yum:
+        name: "epel-release"
+        state: present
+      become: yes
+
+    - name: Install required packages
+      yum:
+        name: "{{ item }}"
+        state: present
+      become: yes
+      with_items:
+        - "python-devel"
+        - "python-pip"
+        - "rpm-build"
+        - "make"
+        - "git"
+        - "gcc"
+
+    - name: Create build folders
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: 0755
+      with_items:
+        - "/root/rpmbuild"
+        - "/root/rpmbuild/SPECS"
+        - "/root/rpmbuild/SOURCES"
+        - "{{ gopath }}/src/k8s.io"
+
+    - name: Install go
+      unarchive:
+        src: "https://storage.googleapis.com/golang/go{{ goversion }}.linux-amd64.tar.gz"
+        dest: "/usr/local"
+        remote_src: yes
+        validate_certs: no
+
+    - name: Download and unpack cloud-provider-openstack archive
+      unarchive:
+        src: "https://github.com/kubernetes/cloud-provider-openstack/archive/{{ branch_name | default('master') }}.zip"
+        dest: "{{ gopath }}/src/k8s.io"
+        remote_src: yes
+        validate_certs: no
+
+    - name: Define version
+      shell: "basename $(ls -d {{ gopath }}/src/k8s.io/cloud-provider-openstack-*) | cut -c 26-"
+      register: command_output
+    - set_fact:
+        current_version: "{{ command_output.stdout }}"
+
+    - name: Make sure cloud-provider-openstack folder doesn't exist
+      file:
+        state: absent
+        path: "{{ gopath }}/src/k8s.io/cloud-provider-openstack/"
+
+    - name: Rename the folder
+      shell: "mv {{ gopath }}/src/k8s.io/cloud-provider-openstack-{{ current_version }} {{ gopath }}/src/k8s.io/cloud-provider-openstack"
+    
+    - name: Download client-keystone-auth rpm spec
+      get_url:
+        url: "https://raw.githubusercontent.com/Fedosin/client-keystone-auth-rpm/master/client-keystone-auth.spec"
+        dest: "/root/rpmbuild/SPECS"
+        validate_certs: no
+    
+    - name: Make the binary
+      shell: "GOROOT={{ goroot }} GOPATH={{ gopath }} PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{{ goroot }}/bin:{{ gopath }}/bin /bin/bash -c 'cd /opt/go/src/k8s.io/cloud-provider-openstack; make client-keystone-auth'"
+    
+    - name: Move the binary to the rpmbuild folder
+      shell: "mv {{ gopath }}/src/k8s.io/cloud-provider-openstack/client-keystone-auth /root/rpmbuild/SOURCES"
+    
+    - name: Set version in the spec
+      shell: "sed -i 's/OVERRIDE_THIS/{{ current_version }}/g' /root/rpmbuild/SPECS/client-keystone-auth.spec"
+    
+    - name: Build rpm packages
+      shell: "rpmbuild -ba /root/rpmbuild/SPECS/client-keystone-auth.spec"
+    
+    - name: Get list of built files
+      shell: "ls /root/rpmbuild/RPMS/x86_64 | grep {{ current_version }}"
+      register: command_output
+    
+    - set_fact:
+        built_packages: "{{ command_output.stdout_lines }}"
+    
+    - name: Fetch built files
+      fetch:
+        src: "/root/rpmbuild/RPMS/x86_64/{{ item }}"
+        dest: rpms/
+        flat: yes
+      with_items:
+        "{{ built_packages }}"
+
+- hosts: localhost
+  gather_facts: no
+  connection: local
+
+  tasks:
+    - name: destroy build container
+      docker_container:
+        name: "{{ vmname }}"
+        state: absent
+
+  vars:
+      vmname: build-centos7
